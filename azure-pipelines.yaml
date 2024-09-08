@@ -1,0 +1,123 @@
+parameters:
+- name: environment
+  displayName: Select Environment
+  type: string
+  default: dev
+  values:
+  - dev
+  - test
+  - prod
+
+trigger:
+- none
+
+resources:
+- repo: self
+
+variables:
+  tag: '$(Build.BuildId)'
+
+stages:
+- stage: Build
+  displayName: Build image
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - task: AzureCLI@2
+      enabled: true
+      inputs:
+        azureSubscription: 'Connection-$(subname)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          azdoip=`curl -s icanhazip.com`
+          echo "Azure DevOps IP Address: $azdoip"
+          az acr network-rule add -n $(prefix)${{ parameters.environment }}AM007 --ip-address $azdoip    
+    - task: Docker@2
+      inputs:
+        containerRegistry: 'acr-$(prefix)-${{ parameters.environment }}-sc'
+        repository: '$(prefix)-${{ parameters.environment }}-$(suffix)'
+        command: 'buildAndPush'
+        Dockerfile: '**/Dockerfile-${{ parameters.environment }}'
+    - task: AzureCLI@2
+      enabled: true
+      inputs:
+        azureSubscription: 'Connection-$(subname)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          azdoip=`curl -s icanhazip.com`
+          echo "Azure DevOps IP Address: $azdoip"
+          az acr network-rule remove -n $(prefix)${{ parameters.environment }}AM007 --ip-address $azdoip        
+    - task: CopyFiles@2
+      inputs:
+        Contents: '**'
+        TargetFolder: '$(build.artifactstagingdirectory)'
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'        
+
+- stage: Deploy
+  displayName: Deploy stage
+  dependsOn: Build
+  jobs:
+  - job: Deploy
+    displayName: Deploy job
+    pool:
+      name: 'build-agent-${{ parameters.environment }}'
+    steps:
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        artifactName: 'drop'
+        downloadPath: '$(System.ArtifactsDirectory)'
+    - task: KubeloginInstaller@0
+      inputs:
+        kubeloginVersion: 'latest'
+    - task: Kubernetes@1
+      inputs:
+        connectionType: 'Kubernetes Service Connection'
+        kubernetesServiceEndpoint: 'aks-default-${{ parameters.environment }}-sc'
+        namespace: 'default'
+        command: 'apply'
+        useConfigurationFile: true
+        configurationType: 'inline'
+        inline: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: $(prefix)-${{ parameters.environment }}-$(suffix)
+            namespace: default
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: $(prefix)-${{ parameters.environment }}-$(suffix)
+            strategy:
+              rollingUpdate:
+                maxSurge: 25%
+                maxUnavailable: 25%
+              type: RollingUpdate
+            template:
+              metadata:
+                labels:
+                  app: $(prefix)-${{ parameters.environment }}-$(suffix)
+              spec:
+                containers:
+                  - name: $(prefix)-${{ parameters.environment }}-$(suffix)
+                    image: $(prefix)${{ parameters.environment }}am007.azurecr.io/$(prefix)-${{ parameters.environment }}-$(suffix):$(Build.BuildId)
+                    ports:
+                    - containerPort: 5000
+                    resources:
+                      requests:
+                        memory: "2500Mi"
+                        cpu: "250m"
+                      limits:
+                        memory: "2500Mi"
+                        cpu: "250m"                     
+        secretType: 'dockerRegistry'
+        containerRegistryType: 'Azure Container Registry'
